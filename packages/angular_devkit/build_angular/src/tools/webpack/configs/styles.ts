@@ -8,9 +8,11 @@
 
 import { SassWorkerImplementation } from '@angular/build/private';
 import MiniCssExtractPlugin from 'mini-css-extract-plugin';
+import { createRequire } from 'node:module';
 import * as path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import type { FileImporter } from 'sass';
+import { satisfies } from 'semver';
 import type { Configuration, LoaderContext, RuleSetUseItem } from 'webpack';
 import { WebpackConfigOptions } from '../../../utils/build-options';
 import { findTailwindConfigurationFile } from '../../../utils/tailwind';
@@ -73,7 +75,7 @@ export async function getStylesConfig(wco: WebpackConfigOptions): Promise<Config
 
   const assetNameTemplate = assetNameTemplateFactory(hashFormat);
 
-  const extraPostcssPlugins: import('postcss').Plugin[] = [];
+  const extraPostcssPlugins: (string | import('postcss').Plugin)[] = [];
 
   // Attempt to setup Tailwind CSS
   // Only load Tailwind CSS plugin if configuration file was found.
@@ -81,19 +83,44 @@ export async function getStylesConfig(wco: WebpackConfigOptions): Promise<Config
   // The package may be unknowningly present due to a third-party transitive package dependency.
   const tailwindConfigPath = await findTailwindConfigurationFile(root, projectRoot);
   if (tailwindConfigPath) {
-    let tailwindPackagePath;
     try {
-      tailwindPackagePath = require.resolve('tailwindcss', { paths: [root] });
-    } catch {
+      // Tailwind 4.x implements its PostCSS plugin as a separate module, this
+      // code will resolve the correct module based on the version of Tailwind CSS,
+      // and suggest they install the correct version if it is not found.
+
+      const workspaceRequire = createRequire(root + '/');
+      const tailwindPackageJsonPath = workspaceRequire.resolve('tailwindcss/package.json');
+      const { version: tailwindVersion } = workspaceRequire(tailwindPackageJsonPath);
+
+      let tailwindPluginPath;
+      // Check if Tailwind CSS version is v4 or greater (considering pre-releases)
+      const isV4Plus = satisfies(tailwindVersion, '>=4.0.0-alpha.1', { includePrerelease: true });
+
+      if (isV4Plus) {
+        try {
+          tailwindPluginPath = workspaceRequire.resolve('@tailwindcss/postcss');
+        } catch (err) {
+          throw new Error(
+            `Tailwind CSS version ${tailwindVersion} requires the '@tailwindcss/postcss' package be used for PostCSS. ` +
+              `Please ensure this package is installed.`,
+          );
+        }
+      } else {
+        // For v3 and below, resolve the main 'tailwindcss' entry point
+        tailwindPluginPath = workspaceRequire.resolve('tailwindcss');
+      }
+
+      // If the plugin path was successfully resolved, add it to the PostCSS plugins
+      if (tailwindPluginPath) {
+        extraPostcssPlugins.push([tailwindPluginPath, { config: tailwindConfigPath }]);
+      }
+    } catch (err) {
       const relativeTailwindConfigPath = path.relative(root, tailwindConfigPath);
       logger.warn(
         `Tailwind CSS configuration file found (${relativeTailwindConfigPath})` +
-          ` but the 'tailwindcss' package is not installed.` +
-          ` To enable Tailwind CSS, please install the 'tailwindcss' package.`,
+          ` but the 'tailwindcss' package could not be resolved or loaded. Please install it.` +
+          ` Error: ${(err as Error)?.message ?? err}`,
       );
-    }
-    if (tailwindPackagePath) {
-      extraPostcssPlugins.push(require(tailwindPackagePath)({ config: tailwindConfigPath }));
     }
   }
 
